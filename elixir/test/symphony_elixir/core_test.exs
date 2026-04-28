@@ -181,6 +181,25 @@ defmodule SymphonyElixir.CoreTest do
              Workflow.load(workflow_path)
   end
 
+  test "workflow load preserves multibyte prompt text while splitting lines" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "MULTIBYTE_WORKFLOW.md")
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: memory
+    ---
+    Write prose in Japanese.
+    Keep repo 内 Markdown text intact.
+    """)
+
+    assert {:ok, %{config: %{"tracker" => %{"kind" => "memory"}}, prompt: prompt}} =
+             Workflow.load(workflow_path)
+
+    assert String.valid?(prompt)
+    assert prompt =~ "repo 内 Markdown"
+  end
+
   test "workflow load accepts unterminated front matter with an empty prompt" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
