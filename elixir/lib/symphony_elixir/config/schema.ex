@@ -308,7 +308,9 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        workspace
+        |> default_workspace_root(settings.workspace.root)
+        |> normalize_runtime_turn_sandbox_policy(policy, opts)
 
       _ ->
         workspace
@@ -503,6 +505,143 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  end
+
+  defp normalize_runtime_turn_sandbox_policy(workspace_root, %{"type" => "workspaceWrite"} = policy, opts) do
+    with {:ok, runtime_workspace_root} <- runtime_workspace_root(workspace_root, opts),
+         {:ok, policy} <- normalize_path_list_field(policy, "writableRoots", runtime_workspace_root, opts),
+         {:ok, policy} <- normalize_read_only_access_field(policy, "readOnlyAccess", runtime_workspace_root, opts) do
+      {:ok, policy}
+    end
+  end
+
+  defp normalize_runtime_turn_sandbox_policy(workspace_root, %{"type" => "readOnly"} = policy, opts) do
+    case Map.fetch(policy, "access") do
+      {:ok, %{} = access} ->
+        with {:ok, runtime_workspace_root} <- runtime_workspace_root(workspace_root, opts),
+             {:ok, access} <- normalize_read_only_access(access, runtime_workspace_root, opts) do
+          {:ok, Map.put(policy, "access", access)}
+        end
+
+      _ ->
+        {:ok, policy}
+    end
+  end
+
+  defp normalize_runtime_turn_sandbox_policy(_workspace_root, policy, _opts) do
+    {:ok, policy}
+  end
+
+  defp runtime_workspace_root(workspace_root, opts) when is_binary(workspace_root) and workspace_root != "" do
+    if Keyword.get(opts, :remote, false) do
+      if Path.type(workspace_root) == :absolute do
+        {:ok, Path.expand(workspace_root)}
+      else
+        {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+      end
+    else
+      workspace_root
+      |> expand_local_workspace_root()
+      |> PathSafety.canonicalize()
+    end
+  end
+
+  defp runtime_workspace_root(workspace_root, _opts) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  end
+
+  defp normalize_read_only_access_field(policy, key, runtime_workspace_root, opts) do
+    case Map.fetch(policy, key) do
+      {:ok, %{} = access} ->
+        with {:ok, access} <- normalize_read_only_access(access, runtime_workspace_root, opts) do
+          {:ok, Map.put(policy, key, access)}
+        end
+
+      _ ->
+        {:ok, policy}
+    end
+  end
+
+  defp normalize_read_only_access(%{"type" => "restricted"} = access, runtime_workspace_root, opts) do
+    normalize_path_list_field(access, "readableRoots", runtime_workspace_root, opts)
+  end
+
+  defp normalize_read_only_access(access, _runtime_workspace_root, _opts), do: {:ok, access}
+
+  defp normalize_path_list_field(policy, key, runtime_workspace_root, opts) do
+    case Map.fetch(policy, key) do
+      {:ok, roots} ->
+        with {:ok, roots} <- normalize_runtime_paths(roots, runtime_workspace_root, opts) do
+          {:ok, Map.put(policy, key, roots)}
+        end
+
+      :error ->
+        {:ok, policy}
+    end
+  end
+
+  defp normalize_runtime_paths(roots, runtime_workspace_root, opts) when is_list(roots) do
+    Enum.reduce_while(roots, {:ok, []}, fn root, {:ok, resolved_roots} ->
+      case normalize_runtime_path(root, runtime_workspace_root, opts) do
+        {:ok, resolved_root} -> {:cont, {:ok, [resolved_root | resolved_roots]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, resolved_roots} -> {:ok, Enum.reverse(resolved_roots)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_runtime_paths(roots, _runtime_workspace_root, _opts) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_path_list, roots}}}
+  end
+
+  defp normalize_runtime_path(root, runtime_workspace_root, opts)
+       when is_binary(root) and root != "" do
+    case Path.type(root) do
+      :absolute ->
+        normalize_absolute_runtime_path(root, opts)
+
+      :relative ->
+        root
+        |> Path.expand(runtime_workspace_root)
+        |> normalize_relative_runtime_path(root, runtime_workspace_root, opts)
+    end
+  end
+
+  defp normalize_runtime_path(root, _runtime_workspace_root, _opts) do
+    {:error, {:unsafe_turn_sandbox_policy, {:invalid_path, root}}}
+  end
+
+  defp normalize_absolute_runtime_path(path, opts) do
+    if Keyword.get(opts, :remote, false) do
+      {:ok, Path.expand(path)}
+    else
+      PathSafety.canonicalize(path)
+    end
+  end
+
+  defp normalize_relative_runtime_path(path, raw_root, runtime_workspace_root, opts) do
+    if Keyword.get(opts, :remote, false) do
+      if path_within_workspace?(path, runtime_workspace_root) do
+        {:ok, path}
+      else
+        {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, raw_root, path, runtime_workspace_root}}}
+      end
+    else
+      with {:ok, canonical_path} <- PathSafety.canonicalize(path) do
+        if path_within_workspace?(canonical_path, runtime_workspace_root) do
+          {:ok, canonical_path}
+        else
+          {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, raw_root, canonical_path, runtime_workspace_root}}}
+        end
+      end
+    end
+  end
+
+  defp path_within_workspace?(path, workspace_root) do
+    path == workspace_root or String.starts_with?(path, workspace_root <> "/")
   end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
