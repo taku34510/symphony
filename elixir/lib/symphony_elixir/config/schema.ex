@@ -132,6 +132,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:session_phase_by_state, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -139,7 +140,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :session_phase_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -147,6 +154,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+      |> update_change(:session_phase_by_state, &Schema.normalize_state_string_map/1)
+      |> Schema.validate_state_string_map(:session_phase_by_state, "phase values")
     end
   end
 
@@ -158,6 +167,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:state_policy_file, :string)
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -183,6 +193,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :state_policy_file,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -335,6 +346,20 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_state_string_map(nil | map()) :: map()
+  def normalize_state_string_map(nil), do: %{}
+
+  def normalize_state_string_map(values) when is_map(values) do
+    Enum.reduce(values, %{}, fn {state_name, value}, acc ->
+      Map.put(
+        acc,
+        normalize_issue_state(to_string(state_name)),
+        normalize_named_string(value)
+      )
+    end)
+  end
+
+  @doc false
   @spec validate_state_limits(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   def validate_state_limits(changeset, field) do
     validate_change(changeset, field, fn ^field, limits ->
@@ -345,6 +370,25 @@ defmodule SymphonyElixir.Config.Schema do
 
           not is_integer(limit) or limit <= 0 ->
             [{field, "limits must be positive integers"}]
+
+          true ->
+            []
+        end
+      end)
+    end)
+  end
+
+  @doc false
+  @spec validate_state_string_map(Ecto.Changeset.t(), atom(), String.t()) :: Ecto.Changeset.t()
+  def validate_state_string_map(changeset, field, value_label) when is_binary(value_label) do
+    validate_change(changeset, field, fn ^field, values ->
+      Enum.flat_map(values, fn {state_name, value} ->
+        cond do
+          to_string(state_name) == "" ->
+            [{field, "state names must not be blank"}]
+
+          not (is_binary(value) and String.trim(value) != "") ->
+            [{field, "#{value_label} must be non-empty strings"}]
 
           true ->
             []
@@ -386,6 +430,18 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp normalize_named_string(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_named_string(value) do
+    value
+    |> to_string()
+    |> normalize_named_string()
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -509,9 +565,8 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_runtime_turn_sandbox_policy(workspace_root, %{"type" => "workspaceWrite"} = policy, opts) do
     with {:ok, runtime_workspace_root} <- runtime_workspace_root(workspace_root, opts),
-         {:ok, policy} <- normalize_path_list_field(policy, "writableRoots", runtime_workspace_root, opts),
-         {:ok, policy} <- normalize_read_only_access_field(policy, "readOnlyAccess", runtime_workspace_root, opts) do
-      {:ok, policy}
+         {:ok, policy} <- normalize_path_list_field(policy, "writableRoots", runtime_workspace_root, opts) do
+      normalize_read_only_access_field(policy, "readOnlyAccess", runtime_workspace_root, opts)
     end
   end
 
@@ -624,20 +679,18 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_relative_runtime_path(path, raw_root, runtime_workspace_root, opts) do
     if Keyword.get(opts, :remote, false) do
-      if path_within_workspace?(path, runtime_workspace_root) do
-        {:ok, path}
-      else
-        {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, raw_root, path, runtime_workspace_root}}}
-      end
+      check_workspace_boundary(path, raw_root, runtime_workspace_root)
     else
       with {:ok, canonical_path} <- PathSafety.canonicalize(path) do
-        if path_within_workspace?(canonical_path, runtime_workspace_root) do
-          {:ok, canonical_path}
-        else
-          {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, raw_root, canonical_path, runtime_workspace_root}}}
-        end
+        check_workspace_boundary(canonical_path, raw_root, runtime_workspace_root)
       end
     end
+  end
+
+  defp check_workspace_boundary(path, raw_root, workspace_root) do
+    if path_within_workspace?(path, workspace_root),
+      do: {:ok, path},
+      else: {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, raw_root, path, workspace_root}}}
   end
 
   defp path_within_workspace?(path, workspace_root) do

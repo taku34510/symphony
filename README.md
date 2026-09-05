@@ -1,5 +1,7 @@
 # Symphony
 
+この fork は PlantStella 向けに、工程別モデル JSON、Implementation スレッドの永続化・再開、独立した AI Review、Rework 時の workspace 再作成を追加する。設定と導入方法は [スレッド運用](elixir/docs/thread-lifecycle.md) を参照する。Symphony 自体は会話を持つ親エージェントにせず、工程とスレッド ID を管理する。
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

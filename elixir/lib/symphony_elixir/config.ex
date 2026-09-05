@@ -61,6 +61,16 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec session_phase_for_state(term()) :: String.t() | nil
+  def session_phase_for_state(state_name) when is_binary(state_name) do
+    config = settings!()
+    normalized_state = Schema.normalize_issue_state(state_name)
+
+    Map.get(config.agent.session_phase_by_state, normalized_state, normalized_state)
+  end
+
+  def session_phase_for_state(_state_name), do: nil
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

@@ -45,7 +45,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, opts) do
         {:ok,
          %{
            port: port,
@@ -88,7 +88,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, Keyword.get(opts, :model_settings, %{})) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -270,54 +270,74 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, opts) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, opts)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}, opts) do
+    thread_id = Keyword.get(opts, :thread_id)
+    model = Keyword.get(opts, :model_settings, %{})
+
+    params = %{
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace
+    }
+
+    params =
+      if is_binary(thread_id),
+        do: Map.put(params, "threadId", thread_id),
+        else: Map.put(params, "dynamicTools", DynamicTool.tool_specs())
+
+    params = if model[:model], do: Map.put(params, "model", model.model), else: params
+
     send_message(port, %{
-      "method" => "thread/start",
+      "method" => if(is_binary(thread_id), do: "thread/resume", else: "thread/start"),
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+        validate_thread_id(thread_payload, thread_id)
 
       other ->
         other
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp validate_thread_id(%{"id" => returned_id}, requested_id) when is_binary(returned_id) do
+    if is_nil(requested_id) or returned_id == requested_id do
+      {:ok, returned_id}
+    else
+      {:error, :resumed_thread_id_mismatch}
+    end
+  end
+
+  defp validate_thread_id(payload, _requested_id), do: {:error, {:invalid_thread_payload, payload}}
+
+  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, model) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
-      "params" => %{
-        "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
-      }
+      "params" =>
+        %{
+          "threadId" => thread_id,
+          "input" => [
+            %{
+              "type" => "text",
+              "text" => prompt
+            }
+          ],
+          "cwd" => workspace,
+          "title" => "#{issue.identifier}: #{issue.title}",
+          "approvalPolicy" => approval_policy,
+          "sandboxPolicy" => turn_sandbox_policy
+        }
+        |> Map.merge(Map.new(model, fn {key, value} -> {to_string(key), value} end))
     })
 
     case await_response(port, @turn_start_id) do

@@ -2173,3 +2173,14 @@ orchestrator but executes worker runs on one or more remote hosts over SSH.
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## PlantStella fork の拡張
+
+Elixir 実装では、`codex.state_policy_file` を指定したローカル worker に工程別のモデル・推論強度とスレッド管理を追加する。仕様は [elixir/docs/thread-lifecycle.md](elixir/docs/thread-lifecycle.md) を正本とする。基本仕様に対し、この設定を使う実行では次を適用する。
+
+- `agent.session_phase_by_state` で工程が変わったら実行プロセスを終了する。同じ試行の Implementation は次の実行で `thread/resume` を使い、それ以外は `thread/start` を使う。
+- 新規 Design の結果は Workpad の Handoff に残し、Implementation と Reviewer の conversation を混ぜない。
+- Rework から Design へ進む前に旧 workspace を削除・再作成し、旧 Implementation の登録を破棄する。
+- 再開対象の rollout が存在しないことが確定した場合だけ、新規スレッドで成果物から復旧する。
+- 起動時にモデル JSON を検証し、実行中の継続ターンには開始時の設定を使う。
+- 使用量の累積値は Implementation 再開時の保存値を差し引いて実行ごとに集計する。

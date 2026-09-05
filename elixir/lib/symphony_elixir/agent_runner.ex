@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, ThreadLifecycle, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -50,8 +50,9 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          with {:ok, context} <- ThreadLifecycle.prepare(workspace, issue),
+               :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+            run_codex_turns(workspace, issue, codex_update_recipient, Keyword.put(opts, :thread_context, context), worker_host)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -95,29 +96,83 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    session_phase = issue_phase(issue)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    context = Keyword.get(opts, :thread_context)
+
+    with {:ok, session, context} <- start_context_session(workspace, worker_host, context) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        with {:ok, context} <- ThreadLifecycle.attach(context, session.thread_id) do
+          do_run_codex_turns(
+            session,
+            workspace,
+            issue,
+            codex_update_recipient,
+            Keyword.merge(opts, thread_context: context, session_phase: session_phase),
+            issue_state_fetcher,
+            1,
+            max_turns
+          )
+        end
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp start_context_session(workspace, worker_host, context) do
+    session_opts = [worker_host: worker_host] ++ ThreadLifecycle.session_options(context)
+
+    case AppServer.start_session(workspace, session_opts) do
+      {:ok, session} ->
+        {:ok, session, context}
+
+      {:error, reason} = error ->
+        if context && context.thread_id && ThreadLifecycle.recoverable?(reason) do
+          recover_context_session(workspace, worker_host, ThreadLifecycle.recovered(context))
+        else
+          error
+        end
+    end
+  end
+
+  defp recover_context_session(workspace, worker_host, recovered) do
+    opts = [worker_host: worker_host] ++ ThreadLifecycle.session_options(recovered)
+
+    case AppServer.start_session(workspace, opts) do
+      {:ok, session} -> {:ok, session, recovered}
+      error -> error
+    end
+  end
+
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    session_phase = Keyword.fetch!(opts, :session_phase)
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    context = Keyword.get(opts, :thread_context)
+    prompt = if turn_number == 1, do: ThreadLifecycle.prompt(context, prompt), else: prompt
+    on_message = codex_message_handler(codex_update_recipient, issue)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
+             on_message: fn message -> on_message.(ThreadLifecycle.observe(context, message)) end,
+             model_settings: Keyword.get(ThreadLifecycle.session_options(context), :model_settings, %{})
+           ),
+         :ok <- ThreadLifecycle.finish_turn(context) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
+      case continue_with_issue?(issue, issue_state_fetcher, session_phase) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
@@ -131,6 +186,11 @@ defmodule SymphonyElixir.AgentRunner do
             turn_number + 1,
             max_turns
           )
+
+        {:phase_changed, refreshed_issue} ->
+          Logger.info("Ending agent run for #{issue_context(refreshed_issue)} due to phase change session_phase=#{session_phase} refreshed_phase=#{issue_phase(refreshed_issue)}")
+
+          :ok
 
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
@@ -160,13 +220,19 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, session_phase)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
+        cond do
+          not active_issue_state?(refreshed_issue.state) ->
+            {:done, refreshed_issue}
+
+          issue_phase(refreshed_issue) == session_phase ->
+            {:continue, refreshed_issue}
+
+          true ->
+            {:phase_changed, refreshed_issue}
         end
 
       {:ok, []} ->
@@ -177,7 +243,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _session_phase), do: {:done, issue}
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
@@ -221,6 +287,12 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.trim()
     |> String.downcase()
   end
+
+  defp issue_phase(%Issue{state: state_name}) when is_binary(state_name) do
+    Config.session_phase_for_state(state_name)
+  end
+
+  defp issue_phase(_issue), do: nil
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
