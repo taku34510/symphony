@@ -1113,7 +1113,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
-  test "runtime sandbox policy resolution passes explicit policies through unchanged" do
+  test "runtime sandbox policy resolution resolves explicit Codex path roots" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1125,11 +1125,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       issue_workspace = Path.join(workspace_root, "MT-100")
       File.mkdir_p!(issue_workspace)
 
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_turn_sandbox_policy: %{
           type: "workspaceWrite",
-          writableRoots: ["relative/path"],
+          writableRoots: [".", ".git/symphony", "relative/path"],
+          readOnlyAccess: %{type: "restricted", readableRoots: ["docs"]},
           networkAccess: true
         }
       )
@@ -1138,7 +1142,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
-               "writableRoots" => ["relative/path"],
+               "writableRoots" => [
+                 canonical_issue_workspace,
+                 Path.join(canonical_issue_workspace, ".git/symphony"),
+                 Path.join(canonical_issue_workspace, "relative/path")
+               ],
+               "readOnlyAccess" => %{
+                 "type" => "restricted",
+                 "readableRoots" => [Path.join(canonical_issue_workspace, "docs")]
+               },
+               "networkAccess" => true
+             }
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "readOnly",
+          access: %{type: "restricted", readableRoots: ["docs"]},
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+
+      assert runtime_settings.turn_sandbox_policy == %{
+               "type" => "readOnly",
+               "access" => %{
+                 "type" => "restricted",
+                 "readableRoots" => [Path.join(canonical_issue_workspace, "docs")]
+               },
                "networkAccess" => true
              }
 
@@ -1156,6 +1188,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "type" => "futureSandbox",
                "nested" => %{"flag" => true}
              }
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: [".."]
+        }
+      )
+
+      assert {:error, {:unsafe_turn_sandbox_policy, {:path_outside_workspace, "..", _path, ^canonical_issue_workspace}}} =
+               Config.codex_runtime_settings(issue_workspace)
     after
       File.rm_rf(test_root)
     end

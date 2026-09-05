@@ -1,5 +1,7 @@
 # Symphony Elixir
 
+PlantStella 向けの工程別モデル JSON、Implementation スレッドの再開、Rework の削除範囲は [thread-lifecycle.md](docs/thread-lifecycle.md) を参照する。
+
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
 

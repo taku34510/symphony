@@ -101,6 +101,9 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
       File.mkdir_p!(workspace)
 
+      assert {:ok, canonical_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(workspace)
+
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-supported-turn-policies.trace}"
@@ -143,14 +146,49 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
+      workspace_write_policy = %{
+        "type" => "workspaceWrite",
+        "writableRoots" => [".", ".git/symphony", "relative/path"],
+        "readOnlyAccess" => %{"type" => "restricted", "readableRoots" => ["docs"]},
+        "networkAccess" => true
+      }
+
+      expected_workspace_write_policy = %{
+        workspace_write_policy
+        | "writableRoots" => [
+            canonical_workspace,
+            Path.join(canonical_workspace, ".git/symphony"),
+            Path.join(canonical_workspace, "relative/path")
+          ],
+          "readOnlyAccess" => %{
+            "type" => "restricted",
+            "readableRoots" => [Path.join(canonical_workspace, "docs")]
+          }
+      }
+
+      read_only_policy = %{
+        "type" => "readOnly",
+        "access" => %{"type" => "restricted", "readableRoots" => ["docs"]},
+        "networkAccess" => true
+      }
+
+      expected_read_only_policy = %{
+        read_only_policy
+        | "access" => %{
+            "type" => "restricted",
+            "readableRoots" => [Path.join(canonical_workspace, "docs")]
+          }
+      }
+
       policy_cases = [
-        %{"type" => "dangerFullAccess"},
-        %{"type" => "externalSandbox", "profile" => "remote-ci"},
-        %{"type" => "workspaceWrite", "writableRoots" => ["relative/path"], "networkAccess" => true},
-        %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
+        {%{"type" => "dangerFullAccess"}, %{"type" => "dangerFullAccess"}},
+        {%{"type" => "externalSandbox", "profile" => "remote-ci"}, %{"type" => "externalSandbox", "profile" => "remote-ci"}},
+        {workspace_write_policy, expected_workspace_write_policy},
+        {read_only_policy, expected_read_only_policy},
+        {%{"type" => "futureSandbox", "nested" => %{"flag" => true}}, %{"type" => "futureSandbox", "nested" => %{"flag" => true}}}
       ]
 
-      Enum.each(policy_cases, fn configured_policy ->
+      Enum.each(policy_cases, fn {configured_policy, expected_policy} ->
         File.rm(trace_file)
 
         write_workflow_file!(Workflow.workflow_file_path(),
@@ -171,7 +209,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
                    end)
                  else
                    false
