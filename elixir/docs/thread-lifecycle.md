@@ -16,7 +16,7 @@ agent:
     Merging: merging
 codex:
   command: codex app-server
-  state_policy_file: project/targets/symphony_models.json
+  state_policy_file: symphony_models.json
 ```
 
 JSON の形式は次のとおり。実行対象の全工程を `states` に含める。
