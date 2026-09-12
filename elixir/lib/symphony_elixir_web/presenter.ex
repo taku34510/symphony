@@ -19,6 +19,10 @@ defmodule SymphonyElixirWeb.Presenter do
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          cleanups:
+            Enum.map(Map.get(snapshot, :cleanups, []), fn entry ->
+              entry |> Map.put(:started_at, iso8601(entry.started_at)) |> Map.put(:status, to_string(entry.status))
+            end),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }

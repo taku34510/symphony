@@ -769,6 +769,9 @@ Note:
 - Retry handling mainly operates on active candidates and releases claims when the issue is absent,
   rather than performing terminal cleanup itself.
 
+PlantStella の Elixir 実装では、再試行時も issue ID から最新状態を照会し、terminal なら非同期削除を要求する。
+active candidate 一覧から消えた直後の正常終了でも workspace を回収するためである。
+
 ### 8.5 Active Run Reconciliation
 
 Reconciliation runs every tick and has two parts.
@@ -799,6 +802,13 @@ When the service starts:
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
 This prevents stale terminal workspaces from accumulating after restarts.
+
+PlantStella のローカル実装では、削除は Orchestrator 外の Task で実行する。worker の終了と子孫プロセスの回収を
+確認してから、workspace 外の排他と世代照合を使って削除する。終了中・削除中の同一 issue は投入しない。
+最後の使用量通知は worker の終了通知まで集計する。失敗時はログと snapshot に残し、他 issue の管理を継続する。
+強制終了や未確認の子孫がある場合は排他を残し、自動再利用を拒否する。
+Linux `/proc` と Python 標準ライブラリの subreaper を使う。SSH の自動削除は終了確認を実装するまで拒否する。
+詳細と運用上の境界は [workspace-cleanup.md](elixir/docs/workspace-cleanup.md) に定める。
 
 ## 9. Workspace Management and Safety
 

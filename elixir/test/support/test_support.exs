@@ -37,6 +37,14 @@ defmodule SymphonyElixir.TestSupport do
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
+        # 長い回帰試験中に、既定の poll が別テストの不正設定を読まないようにする。
+        # 個々の Orchestrator 試験は専用プロセスと明示的な tick を使う。
+        if pid = Process.whereis(SymphonyElixir.Orchestrator) do
+          :sys.replace_state(pid, fn state ->
+            if state.tick_timer_ref, do: Process.cancel_timer(state.tick_timer_ref)
+            %{state | tick_timer_ref: nil, tick_token: nil, next_poll_due_at_ms: nil}
+          end)
+        end
 
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)

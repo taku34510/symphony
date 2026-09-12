@@ -341,6 +341,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     state_payload = json_response(conn, 200)
 
     assert state_payload == %{
+             "cleanups" => [],
              "generated_at" => state_payload["generated_at"],
              "counts" => %{"running" => 1, "retrying" => 1},
              "running" => [

@@ -199,8 +199,14 @@ defmodule SymphonyElixir.ThreadLifecycle do
     }
 
     path = Path.join(storage(context.workspace), "token_usage.jsonl")
-    :ok = regular_or_missing(path)
-    File.write!(path, Jason.encode!(record) <> "\n", [:append])
+
+    with :ok <- regular_or_missing(path),
+         :ok <- File.write(path, Jason.encode!(record) <> "\n", [:append]) do
+      :ok
+    else
+      error -> Logger.warning("Thread usage log write failed #{log_context(context)} thread_id=#{context.active_thread_id} path=#{path} reason=#{inspect(error)}")
+    end
+
     used = get_in(usage, ["last", "totalTokens"])
     window = usage["modelContextWindow"]
 
