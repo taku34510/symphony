@@ -2,6 +2,9 @@
 
 PlantStella 向けの工程別モデル JSON、Implementation スレッドの再開、Rework の削除範囲は [thread-lifecycle.md](docs/thread-lifecycle.md) を参照する。
 
+worker の終了確認、非同期 workspace 削除、障害の調査結果、適用・切り戻し手順は [workspace-cleanup.md](docs/workspace-cleanup.md) を参照する。
+ローカル worker と hook の実行には Linux `/proc` と `python3` が必要。SSH の自動削除は、リモート子孫の終了を確認できないため拒否する。
+
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
 

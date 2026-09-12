@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, WorkspaceCleanup}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -37,6 +37,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      cleanups: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -64,7 +65,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    state = run_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -116,13 +117,29 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case Enum.find(state.cleanups, fn {_id, cleanup} -> cleanup.ref == ref end) do
+      nil ->
+        {:noreply, state}
+
+      {issue_id, cleanup} ->
+        Process.demonitor(ref, [:flush])
+
+        cleanups = finish_cleanup(state.cleanups, issue_id, cleanup, result)
+
+        notify_dashboard()
+        {:noreply, %{state | cleanups: cleanups}}
+    end
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
       ) do
     case find_issue_id_for_ref(running, ref) do
       nil ->
-        {:noreply, state}
+        cleanup = Enum.find(state.cleanups, fn {_id, entry} -> entry.ref == ref or entry.worker_ref == ref end)
+        {:noreply, cleanup_down(state, cleanup, ref, reason)}
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
@@ -186,7 +203,15 @@ defmodule SymphonyElixir.Orchestrator do
       ) do
     case Map.get(running, issue_id) do
       nil ->
-        {:noreply, state}
+        case Map.get(state.cleanups, issue_id) do
+          %{running_entry: entry} = cleanup when is_map(entry) ->
+            {entry, delta} = integrate_codex_update(entry, update)
+            state = state |> apply_codex_token_delta(delta) |> apply_codex_rate_limits(update)
+            {:noreply, %{state | cleanups: Map.put(state.cleanups, issue_id, %{cleanup | running_entry: entry})}}
+
+          _ ->
+            {:noreply, state}
+        end
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
@@ -421,13 +446,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
-
-        if is_pid(pid) do
-          terminate_task(pid)
-        end
+        state = schedule_cleanup(state, issue_id, identifier, worker_host, pid, cleanup_workspace, running_entry)
 
         if is_reference(ref) do
           Process.demonitor(ref, [:flush])
@@ -504,18 +523,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp last_activity_timestamp(_running_entry), do: nil
 
-  defp terminate_task(pid) when is_pid(pid) do
-    case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
-      :ok ->
-        :ok
-
-      {:error, :not_found} ->
-        Process.exit(pid, :shutdown)
-    end
-  end
-
-  defp terminate_task(_pid), do: :ok
-
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
@@ -561,6 +568,7 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      !Map.has_key?(state.cleanups, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -686,7 +694,11 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        if Map.has_key?(state.cleanups, issue.id) do
+          state
+        else
+          spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        end
     end
   end
 
@@ -827,7 +839,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -853,7 +865,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+        state = schedule_cleanup(state, issue_id, issue.identifier, metadata[:worker_host], nil, true, nil)
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -871,28 +883,66 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp finish_cleanup(cleanups, issue_id, %{worker_down: true}, :ok), do: Map.delete(cleanups, issue_id)
 
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp finish_cleanup(cleanups, issue_id, cleanup, :ok) do
+    Map.put(cleanups, issue_id, %{cleanup | status: :finishing})
   end
 
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+  defp finish_cleanup(cleanups, issue_id, cleanup, result) do
+    Map.put(cleanups, issue_id, %{cleanup | status: :failed, error: inspect(result)})
+  end
 
-  defp run_terminal_workspace_cleanup do
+  defp cleanup_down(state, nil, _ref, _reason), do: state
+
+  defp cleanup_down(state, {issue_id, %{worker_ref: ref} = cleanup}, ref, _reason) do
+    cleanups =
+      if cleanup.status == :finishing do
+        Map.delete(state.cleanups, issue_id)
+      else
+        Map.put(state.cleanups, issue_id, %{cleanup | worker_down: true})
+      end
+
+    %{state | cleanups: cleanups}
+  end
+
+  defp cleanup_down(state, {issue_id, cleanup}, _ref, reason) do
+    elapsed = DateTime.diff(DateTime.utc_now(), cleanup.started_at, :millisecond)
+    Logger.error("Workspace cleanup task exited issue_id=#{issue_id} issue_identifier=#{cleanup.identifier} elapsed_ms=#{elapsed} reason=#{inspect(reason)}")
+    failed = %{cleanup | status: :failed, error: inspect(reason)}
+    %{state | cleanups: Map.put(state.cleanups, issue_id, failed)}
+  end
+
+  defp schedule_cleanup(state, issue_id, identifier, host, worker, remove?, entry) do
+    if Map.has_key?(state.cleanups, issue_id) do
+      state
+    else
+      context = %{issue_id: issue_id, identifier: identifier, worker_host: host}
+      worker_ref = if is_pid(worker), do: Process.monitor(worker)
+      task = WorkspaceCleanup.request(context, worker, remove?)
+
+      cleanup =
+        Map.merge(context, %{ref: task.ref, pid: task.pid, status: :pending, error: nil, started_at: DateTime.utc_now(), running_entry: entry, worker_ref: worker_ref, worker_down: not is_pid(worker)})
+
+      %{state | cleanups: Map.put(state.cleanups, issue_id, cleanup)}
+    end
+  end
+
+  defp run_terminal_workspace_cleanup(state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+        |> Enum.reduce(state, fn
+          %Issue{id: id, identifier: identifier}, acc when is_binary(identifier) ->
+            schedule_cleanup(acc, id, identifier, nil, nil, true, nil)
 
-          _ ->
-            :ok
+          _, acc ->
+            acc
         end)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        state
     end
   end
 
@@ -902,6 +952,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
+         !Map.has_key?(state.cleanups, issue.id) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
@@ -1059,9 +1110,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp available_slots(%State{} = state) do
+    stopping = Enum.count(state.cleanups, fn {_id, cleanup} -> not cleanup.worker_down end)
+
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+        map_size(state.running) - stopping,
       0
     )
   end
@@ -1144,6 +1197,10 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       cleanups:
+         Enum.map(state.cleanups, fn {_id, cleanup} ->
+           Map.take(cleanup, [:issue_id, :identifier, :worker_host, :status, :error, :started_at])
+         end),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{

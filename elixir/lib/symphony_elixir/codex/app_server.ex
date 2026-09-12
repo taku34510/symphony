@@ -187,26 +187,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    executable = System.find_executable("bash")
-
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
-
-      {:ok, port}
-    end
+    SymphonyElixir.ManagedProcess.open(Config.settings!().codex.command, workspace, line: @port_line_bytes)
   end
 
   defp start_port(workspace, worker_host) when is_binary(worker_host) do
@@ -359,6 +340,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
+      {:EXIT, _parent, :shutdown} ->
+        throw(:symphony_stop)
+
+      :symphony_stop ->
+        throw(:symphony_stop)
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
@@ -945,6 +932,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
     receive do
+      {:EXIT, _parent, :shutdown} ->
+        throw(:symphony_stop)
+
+      :symphony_stop ->
+        throw(:symphony_stop)
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_response(port, request_id, complete_line, timeout_ms)
@@ -1011,19 +1004,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        :ok
-
-      _ ->
-        try do
-          Port.close(port)
-          :ok
-        rescue
-          ArgumentError ->
-            :ok
-        end
-    end
+    :ok = SymphonyElixir.ManagedProcess.stop(port)
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do

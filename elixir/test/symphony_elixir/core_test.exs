@@ -267,7 +267,7 @@ defmodule SymphonyElixir.CoreTest do
       agent_pid =
         spawn(fn ->
           receive do
-            :stop -> :ok
+            :symphony_stop -> :ok
           end
         end)
 
@@ -296,6 +296,9 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      ref = updated_state.cleanups[issue_id].ref
+      assert_receive {^ref, :ok}, 2_000
 
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
@@ -330,7 +333,7 @@ defmodule SymphonyElixir.CoreTest do
       agent_pid =
         spawn(fn ->
           receive do
-            :stop -> :ok
+            :symphony_stop -> :ok
           end
         end)
 
@@ -359,6 +362,9 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      ref = updated_state.cleanups[issue_id].ref
+      assert_receive {^ref, :ok}, 2_000
 
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
@@ -412,7 +418,7 @@ defmodule SymphonyElixir.CoreTest do
       agent_pid =
         spawn(fn ->
           receive do
-            :stop -> :ok
+            :symphony_stop -> :ok
           end
         end)
 
@@ -492,7 +498,7 @@ defmodule SymphonyElixir.CoreTest do
     agent_pid =
       spawn(fn ->
         receive do
-          :stop -> :ok
+          :symphony_stop -> :ok
         end
       end)
 
@@ -527,6 +533,9 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    ref = updated_state.cleanups[issue_id].ref
+    assert_receive {^ref, :ok}, 2_000
 
     refute Map.has_key?(updated_state.running, issue_id)
     refute MapSet.member?(updated_state.claimed, issue_id)
@@ -605,14 +614,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    earliest_due = System.monotonic_time(:millisecond) + 40_000
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
     state = :sys.get_state(pid)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert due_at_ms >= earliest_due
+    assert due_at_ms <= System.monotonic_time(:millisecond) + 40_000
   end
 
   test "first abnormal worker exit waits before retrying" do

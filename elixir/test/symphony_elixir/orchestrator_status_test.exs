@@ -916,7 +916,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     worker_pid =
       spawn(fn ->
         receive do
-          :done -> :ok
+          :symphony_stop -> :ok
         end
       end)
 

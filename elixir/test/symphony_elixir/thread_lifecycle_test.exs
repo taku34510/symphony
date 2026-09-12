@@ -124,6 +124,36 @@ defmodule SymphonyElixir.ThreadLifecycleTest do
     assert %{} == ThreadLifecycle.observe(context, %{})
   end
 
+  test "late usage tolerates a missing workspace without recreating it", %{workspace: workspace, issue: issue} do
+    {:ok, context} = ThreadLifecycle.prepare(workspace, %{issue | state: "Merging"})
+    {:ok, context} = ThreadLifecycle.attach(context, "last-thread")
+    File.rm_rf!(workspace)
+    event = %{payload: %{"params" => %{"tokenUsage" => %{"total" => %{"inputTokens" => 7}}}}}
+
+    log =
+      capture_log(fn ->
+        assert get_in(ThreadLifecycle.observe(context, event), [:usage, "tokenUsage", "total", "inputTokens"]) == 7
+      end)
+
+    assert log =~ "Thread usage log write failed"
+    assert log =~ "issue_identifier=MT-1"
+    assert log =~ "thread_id=last-thread"
+    assert log =~ ":enoent"
+    refute File.exists?(workspace)
+  end
+
+  test "usage append failure is nonfatal but critical state persistence still fails", %{workspace: workspace, issue: issue} do
+    {:ok, context} = ThreadLifecycle.prepare(workspace, issue)
+    {:ok, context} = ThreadLifecycle.attach(context, "impl")
+    File.mkdir_p!(Path.join(workspace, ".git/symphony/token_usage.jsonl"))
+    event = %{payload: %{"params" => %{"tokenUsage" => %{"total" => %{"inputTokens" => 7}}}}}
+    assert capture_log(fn -> ThreadLifecycle.observe(context, event) end) =~ ":unsafe_session_file"
+    File.rm!(Path.join(workspace, ".git/symphony/session_state.json"))
+    File.mkdir_p!(Path.join(workspace, ".git/symphony/session_state.json"))
+    assert {:error, :unsafe_session_file} = ThreadLifecycle.attach(context, "new")
+    assert_raise RuntimeError, fn -> ThreadLifecycle.observe(context, event) end
+  end
+
   test "review input is scoped to the attempt and rework deletes old workspace", %{workspace: workspace, issue: issue} do
     {:ok, initial} = ThreadLifecycle.prepare(workspace, issue)
     {:ok, initial} = ThreadLifecycle.attach(initial, "impl")

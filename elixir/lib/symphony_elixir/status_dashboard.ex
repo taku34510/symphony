@@ -315,6 +315,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             cleanups: Map.get(snapshot, :cleanups, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -365,6 +366,10 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
+           Enum.map(Map.get(snapshot, :cleanups, []), fn cleanup ->
+             colorize("│ Cleanup: #{cleanup.identifier} #{cleanup.status}", @ansi_yellow) <>
+               if(cleanup.error, do: " #{cleanup.error}", else: "")
+           end),
            colorize("├─ Running", @ansi_bold),
            "│",
            running_table_header_row(running_event_width),
@@ -560,6 +565,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             cleanups: Map.get(snapshot, :cleanups, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)

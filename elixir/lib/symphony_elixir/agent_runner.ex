@@ -5,12 +5,60 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, ThreadLifecycle, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, ManagedProcess, PromptBuilder, ThreadLifecycle, Tracker, Workspace}
+  alias SymphonyElixir.WorkspaceLease
 
   @type worker_host :: String.t() | nil
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    previous = Process.flag(:trap_exit, true)
+
+    try do
+      run_with_lease(issue, codex_update_recipient, opts)
+    after
+      Process.flag(:trap_exit, previous)
+    end
+  end
+
+  defp run_with_lease(issue, codex_update_recipient, opts) do
+    paths = WorkspaceLease.paths(Config.settings!().workspace.root, issue.identifier)
+
+    with :ok <- WorkspaceLease.acquire(paths, %{issue_id: issue.id, issue_identifier: issue.identifier, operation: "worker"}),
+         :ok <- WorkspaceLease.advance(paths) do
+      try do
+        check_stop()
+        run_agent(issue, codex_update_recipient, opts)
+      catch
+        :throw, :symphony_stop -> :ok
+      after
+        case ManagedProcess.stop_all() do
+          :ok ->
+            case WorkspaceLease.release(paths) do
+              :ok -> :ok
+              error -> Logger.error("Workspace lease release failed #{issue_context(issue)} reason=#{inspect(error)}")
+            end
+
+          error ->
+            Logger.error("Workspace processes not stopped; retaining lease #{issue_context(issue)} reason=#{inspect(error)}")
+        end
+      end
+    else
+      error -> raise "workspace lease failed #{issue_context(issue)} reason=#{inspect(error)}"
+    end
+  end
+
+  @spec check_stop() :: :ok | no_return()
+  def check_stop do
+    receive do
+      :symphony_stop -> throw(:symphony_stop)
+      {:EXIT, _parent, :shutdown} -> throw(:symphony_stop)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp run_agent(issue, codex_update_recipient, opts) do
     worker_hosts =
       candidate_worker_hosts(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
@@ -43,6 +91,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_hosts(_issue, _codex_update_recipient, _opts, []), do: {:error, :no_worker_hosts_available}
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    check_stop()
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case Workspace.create_for_issue(issue, worker_host) do
@@ -94,6 +143,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+    check_stop()
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     session_phase = issue_phase(issue)
