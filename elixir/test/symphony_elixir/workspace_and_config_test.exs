@@ -1383,4 +1383,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:invalid_workflow_config, _}} = Schema.parse(%{"codex" => %{"sandbox_by_state" => invalid}})
     end
   end
+
+  test "state workspace overrides retain filesystem restrictions during runtime resolution" do
+    root = Path.join(System.tmp_dir!(), "state-sandbox-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    policy = %{"type" => "workspaceWrite", "writableRoots" => ["."], "networkAccess" => false, "readOnlyAccess" => %{"type" => "fullAccess"}, "excludeTmpdirEnvVar" => true, "excludeSlashTmp" => true}
+    config = %{"codex" => %{"sandbox_by_state" => %{"Design" => %{"thread_sandbox" => "workspace-write", "turn_sandbox_policy" => policy}}}}
+    assert {:ok, settings} = Schema.parse(config)
+    selected = Schema.resolve_state_sandbox(settings, "Design")
+    assert {:ok, resolved} = Schema.resolve_runtime_turn_sandbox_policy(selected, root)
+    assert resolved["writableRoots"] == [root]
+    assert resolved["readOnlyAccess"] == %{"type" => "fullAccess"}
+    assert resolved["networkAccess"] == false
+    assert resolved["excludeTmpdirEnvVar"] and resolved["excludeSlashTmp"]
+
+    # 工程別設定でも、親ディレクトリへの相対パスを受け入れない。
+    escaped = put_in(config, ["codex", "sandbox_by_state", "Design", "turn_sandbox_policy", "writableRoots"], [".."])
+    assert {:ok, escaped} = Schema.parse(escaped)
+
+    assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+             Schema.resolve_runtime_turn_sandbox_policy(Schema.resolve_state_sandbox(escaped, "Design"), root)
+
+    for {key, value} <- [{"writableRoots", "bad"}, {"writableRoots", [nil]}, {"readOnlyAccess", "bad"}] do
+      invalid = put_in(config, ["codex", "sandbox_by_state", "Design", "turn_sandbox_policy", key], value)
+      assert {:error, _} = Schema.parse(invalid)
+    end
+  end
 end
