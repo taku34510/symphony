@@ -150,7 +150,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     context = Keyword.get(opts, :thread_context)
 
-    with {:ok, session, context} <- start_context_session(workspace, worker_host, context) do
+    with {:ok, policies} <- Config.codex_runtime_settings(workspace, issue_state: Map.get(issue, :state), remote: is_binary(worker_host)),
+         {:ok, session, context} <- start_context_session(workspace, worker_host, context, policies) do
       try do
         with {:ok, context} <- ThreadLifecycle.attach(context, session.thread_id) do
           do_run_codex_turns(
@@ -170,8 +171,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp start_context_session(workspace, worker_host, context) do
-    session_opts = [worker_host: worker_host] ++ ThreadLifecycle.session_options(context)
+  defp start_context_session(workspace, worker_host, context, policies) do
+    session_opts = [worker_host: worker_host, sandbox_settings: policies] ++ ThreadLifecycle.session_options(context)
 
     case AppServer.start_session(workspace, session_opts) do
       {:ok, session} ->
@@ -179,15 +180,15 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} = error ->
         if context && context.thread_id && ThreadLifecycle.recoverable?(reason) do
-          recover_context_session(workspace, worker_host, ThreadLifecycle.recovered(context))
+          recover_context_session(workspace, worker_host, ThreadLifecycle.recovered(context), policies)
         else
           error
         end
     end
   end
 
-  defp recover_context_session(workspace, worker_host, recovered) do
-    opts = [worker_host: worker_host] ++ ThreadLifecycle.session_options(recovered)
+  defp recover_context_session(workspace, worker_host, recovered, policies) do
+    opts = [worker_host: worker_host, sandbox_settings: policies] ++ ThreadLifecycle.session_options(recovered)
 
     case AppServer.start_session(workspace, opts) do
       {:ok, session} -> {:ok, session, recovered}

@@ -33,6 +33,9 @@ codex:
   # 対応する工程名と session_phase_by_state は docs/thread-lifecycle.md を参照する。
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
   approval_policy: never
+  # 工程別権限は sandbox_by_state で任意に指定する（省略時は共通設定）。
+  # 例: {Implementation: {thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}}}
+  # AI Review も同じ組を指定できる。他工程の制限は共通設定で維持する。
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite

@@ -119,6 +119,9 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- 工程別の権限は任意の `codex.sandbox_by_state` で指定する。状態名は前後の空白と大文字・小文字を正規化する。各値には `thread_sandbox` と `turn_sandbox_policy` を必須とし、対応する組だけを受け付ける。重複する状態、不正な型、未知の項目、組の不整合は設定エラーとする。未指定の状態は共通設定を使う。
+- 設定例: `sandbox_by_state: {Implementation: {thread_sandbox: danger-full-access, turn_sandbox_policy: {type: dangerFullAccess}}}`。`AI Review` も同じ組を指定できる。他工程を一括で Full Access にしない。
+- 新規・再開・消失復旧には開始時の同じ権限を渡し、継続ターンも固定する。次の実行では設定を再読込みするが、Implementation の thread ID は維持する。`Codex sandbox selected` のログで送信した設定を確認できる。実際の実効権限は Codex の受付応答と動作でも確認する。
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex

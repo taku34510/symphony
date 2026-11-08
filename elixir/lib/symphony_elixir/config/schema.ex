@@ -181,6 +181,7 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      field(:sandbox_by_state, :map, default: %{})
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
@@ -197,6 +198,7 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :sandbox_by_state,
           :turn_timeout_ms,
           :read_timeout_ms,
           :stall_timeout_ms
@@ -286,8 +288,21 @@ defmodule SymphonyElixir.Config.Schema do
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
   def parse(config) when is_map(config) do
+    config = normalize_keys(config)
+
+    overrides =
+      case config["codex"] do
+        %{} = codex -> Map.get(codex, "sandbox_by_state")
+        _ -> nil
+      end
+
+    with :ok <- validate_state_sandboxes(overrides, config) do
+      parse_validated(config)
+    end
+  end
+
+  defp parse_validated(config) do
     config
-    |> normalize_keys()
     |> drop_nil_values()
     |> changeset()
     |> apply_action(:validate)
@@ -298,6 +313,63 @@ defmodule SymphonyElixir.Config.Schema do
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
     end
+  end
+
+  @spec resolve_state_sandbox(%__MODULE__{}, term()) :: %__MODULE__{}
+  def resolve_state_sandbox(settings, state) do
+    state = if is_binary(state), do: state |> String.trim() |> String.downcase(), else: nil
+
+    case Map.get(settings.codex.sandbox_by_state, state) do
+      nil ->
+        settings
+
+      override ->
+        %{settings | codex: %{settings.codex | thread_sandbox: override["thread_sandbox"], turn_sandbox_policy: override["turn_sandbox_policy"]}}
+    end
+  end
+
+  defp validate_state_sandboxes(nil, config) do
+    if is_map(config["codex"]) and Map.has_key?(config["codex"], "sandbox_by_state"),
+      do: {:error, {:invalid_workflow_config, "codex.sandbox_by_state must be an object"}},
+      else: :ok
+  end
+
+  defp validate_state_sandboxes(values, _config) when is_map(values) do
+    names = Enum.map(Map.keys(values), &String.downcase(String.trim(&1)))
+
+    if "" in names or length(Enum.uniq(names)) != length(names) or
+         not Enum.all?(values, fn {_state, value} -> valid_state_sandbox?(value) end) do
+      {:error, {:invalid_workflow_config, "codex.sandbox_by_state requires unique nonblank states and matching sandbox pairs"}}
+    else
+      :ok
+    end
+  end
+
+  defp validate_state_sandboxes(_values, _config),
+    do: {:error, {:invalid_workflow_config, "codex.sandbox_by_state must be an object"}}
+
+  defp valid_state_sandbox?(%{"thread_sandbox" => thread, "turn_sandbox_policy" => %{"type" => type} = policy} = value)
+       when map_size(value) == 2 do
+    pair? = {thread, type} in [{"read-only", "readOnly"}, {"workspace-write", "workspaceWrite"}, {"danger-full-access", "dangerFullAccess"}]
+    pair? and valid_state_turn_policy?(type, policy)
+  end
+
+  defp valid_state_sandbox?(_value), do: false
+
+  defp valid_state_turn_policy?("dangerFullAccess", policy), do: map_size(policy) == 1
+
+  defp valid_state_turn_policy?(type, policy) do
+    allowed =
+      if type == "workspaceWrite",
+        do: ~w(type writableRoots readOnlyAccess networkAccess excludeTmpdirEnvVar excludeSlashTmp),
+        else: ~w(type access networkAccess)
+
+    Enum.all?(policy, fn
+      {"type", _} -> true
+      {"writableRoots", roots} -> is_list(roots) and Enum.all?(roots, &is_binary/1)
+      {key, access} when key in ["readOnlyAccess", "access"] -> is_map(access)
+      {key, flag} -> key in allowed and is_boolean(flag)
+    end) and Enum.all?(Map.keys(policy), &(&1 in allowed))
   end
 
   @spec resolve_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil) :: map()
@@ -426,7 +498,11 @@ defmodule SymphonyElixir.Config.Schema do
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
-        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
+        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy),
+        sandbox_by_state:
+          Map.new(settings.codex.sandbox_by_state, fn {state, value} ->
+            {state |> String.trim() |> String.downcase(), value}
+          end)
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
