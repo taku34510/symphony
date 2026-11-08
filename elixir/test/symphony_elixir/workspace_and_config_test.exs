@@ -1342,4 +1342,72 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "state sandbox overrides normalize names and leave all other states restricted" do
+    full = %{"thread_sandbox" => "danger-full-access", "turn_sandbox_policy" => %{"type" => "dangerFullAccess"}}
+    config = %{"codex" => %{"sandbox_by_state" => %{" Implementation " => full, "AI Review" => full}}}
+    assert {:ok, settings} = Schema.parse(config)
+
+    for state <- ["Implementation", " implementation ", "AI Review", "ai review"] do
+      selected = Schema.resolve_state_sandbox(settings, state)
+      assert selected.codex.thread_sandbox == "danger-full-access"
+      assert {:ok, %{"type" => "dangerFullAccess"}} = Schema.resolve_runtime_turn_sandbox_policy(selected, "/tmp")
+    end
+
+    for state <- [nil, "Todo", "Design", "Human Review", "Review Q&A", "Rework", "Merging", "Done", "unknown"] do
+      assert Schema.resolve_state_sandbox(settings, state).codex.thread_sandbox == "workspace-write"
+    end
+
+    read_only = %{"thread_sandbox" => "read-only", "turn_sandbox_policy" => %{"type" => "readOnly"}}
+    assert {:ok, settings} = Schema.parse(put_in(config, ["codex", "sandbox_by_state"], %{"Design" => read_only}))
+    assert Schema.resolve_state_sandbox(settings, "Design").codex.thread_sandbox == "read-only"
+  end
+
+  test "state sandbox rejects malformed maps, duplicate states and inconsistent policy pairs" do
+    full = %{"thread_sandbox" => "danger-full-access", "turn_sandbox_policy" => %{"type" => "dangerFullAccess"}}
+
+    for invalid <- [
+          nil,
+          [],
+          "bad",
+          %{" " => full},
+          %{"Implementation" => full, " implementation " => full},
+          %{"Implementation" => nil},
+          %{"Implementation" => %{}},
+          %{"Implementation" => Map.put(full, "typo", true)},
+          %{"Implementation" => Map.put(full, "thread_sandbox", "workspace-write")},
+          %{"Implementation" => Map.put(full, "turn_sandbox_policy", %{"type" => "unknown"})},
+          %{"Implementation" => Map.put(full, "turn_sandbox_policy", %{"type" => "dangerFullAccess", "networkAccess" => true})},
+          %{"Implementation" => %{"thread_sandbox" => "workspace-write", "turn_sandbox_policy" => %{"type" => "workspaceWrite", "networkAccess" => "yes"}}}
+        ] do
+      assert {:error, {:invalid_workflow_config, _}} = Schema.parse(%{"codex" => %{"sandbox_by_state" => invalid}})
+    end
+  end
+
+  test "state workspace overrides retain filesystem restrictions during runtime resolution" do
+    root = Path.join(System.tmp_dir!(), "state-sandbox-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    policy = %{"type" => "workspaceWrite", "writableRoots" => ["."], "networkAccess" => false, "readOnlyAccess" => %{"type" => "fullAccess"}, "excludeTmpdirEnvVar" => true, "excludeSlashTmp" => true}
+    config = %{"codex" => %{"sandbox_by_state" => %{"Design" => %{"thread_sandbox" => "workspace-write", "turn_sandbox_policy" => policy}}}}
+    assert {:ok, settings} = Schema.parse(config)
+    selected = Schema.resolve_state_sandbox(settings, "Design")
+    assert {:ok, resolved} = Schema.resolve_runtime_turn_sandbox_policy(selected, root)
+    assert resolved["writableRoots"] == [root]
+    assert resolved["readOnlyAccess"] == %{"type" => "fullAccess"}
+    assert resolved["networkAccess"] == false
+    assert resolved["excludeTmpdirEnvVar"] and resolved["excludeSlashTmp"]
+
+    # 工程別設定でも、親ディレクトリへの相対パスを受け入れない。
+    escaped = put_in(config, ["codex", "sandbox_by_state", "Design", "turn_sandbox_policy", "writableRoots"], [".."])
+    assert {:ok, escaped} = Schema.parse(escaped)
+
+    assert {:error, {:unsafe_turn_sandbox_policy, _}} =
+             Schema.resolve_runtime_turn_sandbox_policy(Schema.resolve_state_sandbox(escaped, "Design"), root)
+
+    for {key, value} <- [{"writableRoots", "bad"}, {"writableRoots", [nil]}, {"readOnlyAccess", "bad"}] do
+      invalid = put_in(config, ["codex", "sandbox_by_state", "Design", "turn_sandbox_policy", key], value)
+      assert {:error, _} = Schema.parse(invalid)
+    end
+  end
 end

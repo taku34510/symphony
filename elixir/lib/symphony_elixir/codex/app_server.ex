@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put_new(opts, :issue_state, Map.get(issue, :state))) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -44,8 +44,10 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, opts) do
+        Logger.info("Codex sandbox selected thread_id=#{thread_id} thread_sandbox=#{session_policies.thread_sandbox} turn_sandbox=#{session_policies.turn_sandbox_policy["type"]}")
+
         {:ok,
          %{
            port: port,
@@ -243,12 +245,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
-  end
-
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, opts) do
+    case Keyword.fetch(opts, :sandbox_settings) do
+      {:ok, settings} -> {:ok, settings}
+      :error -> Config.codex_runtime_settings(workspace, issue_state: Keyword.get(opts, :issue_state), remote: is_binary(worker_host))
+    end
   end
 
   defp do_start_session(port, workspace, session_policies, opts) do

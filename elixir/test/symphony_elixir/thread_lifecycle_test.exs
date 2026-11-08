@@ -310,6 +310,38 @@ defmodule SymphonyElixir.ThreadLifecycleTest do
     end
   end
 
+  test "runner preserves phase permissions through fresh, resume, recovery and continuous turns", context do
+    configure_runner(context, "ok")
+    text = File.read!(Workflow.workflow_file_path())
+
+    overrides =
+      "  sandbox_by_state:\n    Implementation:\n      thread_sandbox: danger-full-access\n      turn_sandbox_policy: {type: dangerFullAccess}\n    AI Review:\n      thread_sandbox: danger-full-access\n      turn_sandbox_policy: {type: dangerFullAccess}\n"
+
+    File.write!(Workflow.workflow_file_path(), String.replace(text, "codex:\n", "codex:\n" <> overrides))
+    stop = fn _ -> {:ok, [%{context.issue | state: "Human Review"}]} end
+
+    continue = fn _ ->
+      # 実行途中の設定変更は次の実行まで反映しない。
+      File.write!(Workflow.workflow_file_path(), text)
+      {:ok, [context.issue]}
+    end
+
+    assert :ok = AgentRunner.run(context.issue, nil, issue_state_fetcher: continue, max_turns: 2)
+    assert :ok = AgentRunner.run(context.issue, nil, issue_state_fetcher: stop)
+    File.write!(Workflow.workflow_file_path(), String.replace(text, "codex:\n", "codex:\n" <> overrides))
+    assert :ok = AgentRunner.run(%{context.issue | state: "AI Review"}, nil, issue_state_fetcher: stop)
+    configure_runner(context, "missing")
+    assert :ok = AgentRunner.run(context.issue, nil, issue_state_fetcher: stop)
+    turns = requests(context) |> Enum.filter(&(&1["method"] == "turn/start"))
+    assert Enum.map(turns, & &1["params"]["sandboxPolicy"]["type"]) == ["dangerFullAccess", "dangerFullAccess", "workspaceWrite", "dangerFullAccess", "dangerFullAccess"]
+    thread_calls = requests(context) |> Enum.filter(&(&1["method"] in ["thread/start", "thread/resume"]))
+    assert Enum.map(thread_calls, & &1["params"]["sandbox"]) == ["danger-full-access", "workspace-write", "danger-full-access", "danger-full-access", "danger-full-access"]
+    assert Enum.at(thread_calls, 0)["method"] == "thread/start"
+    assert Enum.at(thread_calls, 1)["method"] == "thread/resume"
+    assert hd(thread_calls)["params"]["threadId"] == nil
+    assert Enum.at(turns, 0)["params"]["threadId"] == Enum.at(turns, 2)["params"]["threadId"]
+  end
+
   defp requests(context) do
     Path.join(context.root, "trace.jsonl") |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
   end
